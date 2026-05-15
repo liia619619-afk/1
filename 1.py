@@ -884,7 +884,7 @@ def personal_mode():
             ax1.legend(handles=[peak_patch, valley_patch] + lines2,
                        loc='upper left', frameon=True, fontsize=9)
 
-            # 不在导出的图片中添加标题
+            ax1.set_title(f'{car_name} — 最优充电方案（22:00—{depart_time:02d}:00）')
             plt.tight_layout()
             show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
@@ -1163,8 +1163,8 @@ def multi_vehicle_mode():
             ax.set_xticklabels(slabels[::2], rotation=45, fontsize=9)
             ax.set_xlabel('时段')
             ax.set_ylabel('聚合充电功率 (kW)')
-            # 不在导出的图片中添加标题
-            ax.legend(frameon=True, loc='upper right', fontsize=9)
+            ax.set_title(f'各策略聚合负荷时序曲线（聚合功率上限 {P_agg_max} kW）')
+            ax.legend(frameon=True, loc='lower right', fontsize=9)
             plt.tight_layout()
             show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
@@ -1195,7 +1195,7 @@ def multi_vehicle_mode():
                 ax.set_yticklabels(veh_ids, fontsize=9)
                 ax.set_xlabel('时段')
                 ax.set_ylabel('车辆编号')
-                # 不在导出的图片中添加标题
+                ax.set_title('MILP 策略各车辆各时段充电功率热力图')
 
                 for i in range(N_v):
                     for t in range(n_slots):
@@ -1243,12 +1243,13 @@ def multi_vehicle_mode():
                 if ax_idx == 0:
                     ax.set_ylabel('SOC (%)')
                 v = vehicles[ev_idx]
-                # 不在导出的图片中添加子图标题
+                ax.set_title(f'{v["编号"]}（{v["容量"]}kWh, {v["最大功率"]}kW）',
+                             fontsize=10)
                 ax.set_ylim(0, 108)
                 if ax_idx == n_rep - 1:
                     ax.legend(fontsize=7, loc='lower right', frameon=True)
 
-            # 不在导出的图片中添加总标题
+            fig.suptitle('典型车辆 SOC 演化曲线', fontsize=14, fontweight='bold')
             plt.tight_layout()
             show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
@@ -1296,7 +1297,7 @@ def multi_vehicle_mode():
                 ax.set_xticks(x_bar)
                 ax.set_xticklabels(names_plot, fontsize=9)
                 ax.set_ylabel('归一化加权目标值')
-                # 不在导出的图片中添加标题
+                ax.set_title('各策略综合目标成本构成对比')
                 ax.legend(frameon=True)
                 ax.set_ylim(0, ax.get_ylim()[1] * 1.2)
                 plt.tight_layout()

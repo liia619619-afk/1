@@ -8,76 +8,225 @@
 ★ 已与主仿真代码统一口径（参数/公式/策略逻辑/返回字段/显示格式）
 """
 
-import os
-import re
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.font_manager as fm
 from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.font_manager as fm
 import pandas as pd
 import time
 import warnings
 import io
+import os
+import tempfile
+from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
-# ── 字体与高清导出配置 ─────────────────────────────────────────────────────────
-def setup_chinese_font():
-    """
-    自动寻找系统中文字体，解决 Matplotlib 中文显示为方框的问题。
-    同时设置 SVG/PDF 导出策略：
-    - SVG 文字转为路径，插入 Word/PPT 后不依赖电脑字体，缩放不糊、不变方框；
-    - PDF 尽量嵌入 TrueType 字体，适合论文和打印。
-    """
-    candidate_paths = [
+# ── 高清导出 + 中文字体配置 ───────────────────────────────────────────────────
+# 说明：只在 rcParams 里写 SimHei / Microsoft YaHei 不一定生效。
+# 如果当前系统没装中文字体，Matplotlib 会退回到不支持中文的字体，于是中文会显示成“□□”。
+# 下面会优先主动加载 Windows/macOS/Linux 常见中文字体；如果还是找不到，
+# 可以把字体文件放到本脚本同级 fonts 文件夹，或在左侧上传 .ttf/.ttc/.otf 字体文件。
+_FONT_STATUS = {"ok": False, "name": None, "path": None, "message": "尚未检测字体"}
+_TEMP_FONT_FILES = []
+
+
+def _candidate_font_paths():
+    """返回常见中文字体路径；同时扫描脚本目录、当前目录、fonts 目录。"""
+    script_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    common = [
         # Windows
-        r"C:\\Windows\\Fonts\\msyh.ttc",       # 微软雅黑
-        r"C:\\Windows\\Fonts\\msyh.ttf",
-        r"C:\\Windows\\Fonts\\simhei.ttf",     # 黑体
-        r"C:\\Windows\\Fonts\\simsun.ttc",     # 宋体
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        r"C:\Windows\Fonts\simkai.ttf",
         # macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
-        # Linux / Streamlit Cloud / Ubuntu
+        "/Library/Fonts/Songti.ttc",
+        # Linux / Streamlit Cloud / Docker
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
     ]
-
-    for font_path in candidate_paths:
-        if os.path.exists(font_path):
-            try:
-                fm.fontManager.addfont(font_path)
-                font_name = fm.FontProperties(fname=font_path).get_name()
-                matplotlib.rcParams['font.family'] = 'sans-serif'
-                matplotlib.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
-                return font_name
-            except Exception:
-                continue
-
-    # 若没有找到字体，仍给出常见字体候选；但本机未安装中文字体时仍可能出现方框。
-    matplotlib.rcParams['font.family'] = 'sans-serif'
-    matplotlib.rcParams['font.sans-serif'] = [
-        'Microsoft YaHei', 'SimHei', 'PingFang SC', 'Noto Sans CJK SC',
-        'WenQuanYi Micro Hei', 'Arial Unicode MS', 'DejaVu Sans'
-    ]
-    return None
+    local_dirs = [script_dir, Path.cwd(), script_dir / "fonts", Path.cwd() / "fonts"]
+    local = []
+    for d in local_dirs:
+        if d.exists():
+            for ext in ("*.ttf", "*.ttc", "*.otf"):
+                local.extend(str(x) for x in d.glob(ext))
+    # 去重并保持顺序
+    seen, out = set(), []
+    for fp in common + local:
+        if fp not in seen:
+            seen.add(fp)
+            out.append(fp)
+    return out
 
 
-CHINESE_FONT_NAME = setup_chinese_font()
-matplotlib.rcParams['axes.unicode_minus'] = False
-matplotlib.rcParams['figure.dpi'] = 200
-matplotlib.rcParams['savefig.dpi'] = 600
-matplotlib.rcParams['savefig.bbox'] = 'tight'
-matplotlib.rcParams['savefig.pad_inches'] = 0.05
-matplotlib.rcParams['svg.fonttype'] = 'path'  # 关键：SVG 文字转路径，插入文档后不依赖字体
-matplotlib.rcParams['pdf.fonttype'] = 42      # TrueType，便于 PDF 嵌入字体
-matplotlib.rcParams['ps.fonttype'] = 42
+def _font_supports_chinese(font_path):
+    """用 Matplotlib 自带 FT2Font 检查字体是否含中文字符。"""
+    try:
+        ft = matplotlib.ft2font.FT2Font(str(font_path))
+        cmap = ft.get_charmap()
+        return ord("中") in cmap or ord("电") in cmap or ord("车") in cmap
+    except Exception:
+        return False
+
+
+def _activate_font(font_path):
+    """主动注册并启用指定字体。"""
+    global _FONT_STATUS
+    try:
+        font_path = str(font_path)
+        fm.fontManager.addfont(font_path)
+        font_name = fm.FontProperties(fname=font_path).get_name()
+        matplotlib.rcParams["font.family"] = "sans-serif"
+        matplotlib.rcParams["font.sans-serif"] = [font_name]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+        matplotlib.rcParams["figure.dpi"] = 180
+        matplotlib.rcParams["savefig.dpi"] = 600
+        # 插入 Word/PPT 推荐用 SVG；文字转路径后，文档端不再依赖本机字体
+        matplotlib.rcParams["svg.fonttype"] = "path"
+        matplotlib.rcParams["pdf.fonttype"] = 42
+        matplotlib.rcParams["ps.fonttype"] = 42
+        _FONT_STATUS = {
+            "ok": True,
+            "name": font_name,
+            "path": font_path,
+            "message": f"已启用中文字体：{font_name}",
+        }
+        return True
+    except Exception as exc:
+        _FONT_STATUS = {"ok": False, "name": None, "path": None, "message": f"字体加载失败：{exc}"}
+        return False
+
+
+def setup_chinese_font(uploaded_font=None):
+    """设置中文字体。uploaded_font 是 Streamlit file_uploader 返回的对象，可为空。"""
+    global _TEMP_FONT_FILES, _FONT_STATUS
+
+    # 1) 用户上传字体时优先使用上传字体
+    if uploaded_font is not None:
+        suffix = Path(uploaded_font.name).suffix.lower() or ".ttf"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded_font.getbuffer())
+        tmp.close()
+        _TEMP_FONT_FILES.append(tmp.name)
+        if _font_supports_chinese(tmp.name) and _activate_font(tmp.name):
+            return _FONT_STATUS
+        _FONT_STATUS = {
+            "ok": False, "name": None, "path": tmp.name,
+            "message": "上传的字体不含常用中文字符，请换 SimHei、微软雅黑、思源黑体或 Noto Sans CJK。"
+        }
+        return _FONT_STATUS
+
+    # 2) 常见路径 + 本地 fonts 目录
+    for fp in _candidate_font_paths():
+        if os.path.exists(fp) and _font_supports_chinese(fp):
+            if _activate_font(fp):
+                return _FONT_STATUS
+
+    # 3) 扫描系统字体目录，找到真正支持中文的字体
+    for fp in fm.findSystemFonts(fontpaths=None, fontext="ttf") + fm.findSystemFonts(fontpaths=None, fontext="otf"):
+        if _font_supports_chinese(fp):
+            if _activate_font(fp):
+                return _FONT_STATUS
+
+    # 4) 没找到时保底配置；此时中文仍可能显示方框，因此会在界面提示
+    matplotlib.rcParams["font.family"] = "sans-serif"
+    matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    matplotlib.rcParams["figure.dpi"] = 180
+    matplotlib.rcParams["savefig.dpi"] = 600
+    matplotlib.rcParams["svg.fonttype"] = "path"
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
+    _FONT_STATUS = {
+        "ok": False,
+        "name": None,
+        "path": None,
+        "message": "当前运行环境没有检测到中文字体，所以图中的中文会显示成方框。"
+    }
+    return _FONT_STATUS
+
+
+def show_font_status_in_sidebar():
+    """在侧边栏显示字体状态，并允许上传字体。"""
+    with st.sidebar.expander("🈶 中文字体/高清导出设置", expanded=not _FONT_STATUS.get("ok", False)):
+        uploaded_font = st.file_uploader(
+            "中文仍是方框时，上传一个字体文件",
+            type=["ttf", "ttc", "otf"],
+            help="推荐：msyh.ttc、simhei.ttf、NotoSansCJK-Regular.ttc、SourceHanSansSC-Regular.otf"
+        )
+        if uploaded_font is not None:
+            setup_chinese_font(uploaded_font)
+        if _FONT_STATUS.get("ok"):
+            st.success(_FONT_STATUS["message"])
+            st.caption(f"字体文件：{_FONT_STATUS.get('path')}")
+        else:
+            st.error(_FONT_STATUS["message"])
+            st.markdown(
+                "把中文字体文件放到代码同级的 `fonts/` 文件夹，或在这里上传字体文件后再生成图。"
+            )
+        st.caption("导出图片建议优先下载 SVG，插入 Word/PPT 后缩放不容易模糊。")
+
+
+def fig_to_bytes(fig, fmt="png", dpi=600):
+    """把 Matplotlib 图保存成字节，用于下载按钮。"""
+    buf = io.BytesIO()
+    if fmt.lower() == "png":
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    else:
+        fig.savefig(buf, format=fmt, bbox_inches="tight", facecolor="white")
+    return buf.getvalue()
+
+
+def show_fig_with_downloads(fig, base_name="figure"):
+    """Streamlit 显示图，并提供 SVG/PDF/600DPI PNG 下载。"""
+    st.pyplot(fig, use_container_width=True)
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in base_name)[:80] or "figure"
+    key = f"{safe_name}_{id(fig)}"
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button(
+            "📥 下载 SVG 矢量图",
+            fig_to_bytes(fig, "svg"),
+            file_name=f"{safe_name}.svg",
+            mime="image/svg+xml",
+            key=f"{key}_svg",
+            use_container_width=True,
+        )
+    with col2:
+        st.download_button(
+            "📥 下载 PDF 矢量图",
+            fig_to_bytes(fig, "pdf"),
+            file_name=f"{safe_name}.pdf",
+            mime="application/pdf",
+            key=f"{key}_pdf",
+            use_container_width=True,
+        )
+    with col3:
+        st.download_button(
+            "📥 下载 600DPI PNG",
+            fig_to_bytes(fig, "png", dpi=600),
+            file_name=f"{safe_name}.png",
+            mime="image/png",
+            key=f"{key}_png",
+            use_container_width=True,
+        )
+
+
+# 先尝试加载系统中文字体；Streamlit 启动后还可以在侧边栏上传字体重新加载
+setup_chinese_font()
 
 plt.rcParams.update({
     'axes.spines.top':    False,
@@ -566,69 +715,6 @@ def _result_status_text(strategy_name, r):
 
 
 # =============================================================================
-# 6a. 高清/矢量图导出辅助函数
-# =============================================================================
-def _safe_filename(name):
-    """把图名转换成适合保存的文件名。"""
-    name = str(name).strip().replace(' ', '_')
-    name = re.sub(r'[\\/:*?"<>|]+', '_', name)
-    name = re.sub(r'_+', '_', name)
-    return name or 'figure'
-
-
-def fig_to_bytes(fig, fmt='svg', dpi=600):
-    """将 Matplotlib Figure 保存到内存，供 Streamlit 下载按钮使用。"""
-    buf = io.BytesIO()
-    save_kwargs = {
-        'format': fmt,
-        'bbox_inches': 'tight',
-        'pad_inches': 0.05,
-        'facecolor': 'white',
-    }
-    if fmt.lower() in ('png', 'jpg', 'jpeg', 'tiff'):
-        save_kwargs['dpi'] = dpi
-    fig.savefig(buf, **save_kwargs)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def add_figure_download_buttons(fig, base_filename, key_prefix):
-    """
-    为每张图添加 SVG/PDF/PNG 下载按钮。
-    Word/PPT 优先插入 SVG；LaTeX/论文排版优先 PDF；PNG 仅作为兼容备用。
-    """
-    base = _safe_filename(base_filename)
-    col_svg, col_pdf, col_png = st.columns(3)
-    with col_svg:
-        st.download_button(
-            '📥 下载 SVG 矢量图（推荐插入 Word/PPT）',
-            data=fig_to_bytes(fig, 'svg'),
-            file_name=f'{base}.svg',
-            mime='image/svg+xml',
-            key=f'{key_prefix}_svg',
-            use_container_width=True,
-        )
-    with col_pdf:
-        st.download_button(
-            '📥 下载 PDF 矢量图（论文/打印）',
-            data=fig_to_bytes(fig, 'pdf'),
-            file_name=f'{base}.pdf',
-            mime='application/pdf',
-            key=f'{key_prefix}_pdf',
-            use_container_width=True,
-        )
-    with col_png:
-        st.download_button(
-            '📥 下载 600DPI PNG（兼容备用）',
-            data=fig_to_bytes(fig, 'png', dpi=600),
-            file_name=f'{base}.png',
-            mime='image/png',
-            key=f'{key_prefix}_png',
-            use_container_width=True,
-        )
-
-
-# =============================================================================
 # 7. 个人用户单车充电规划模式
 # =============================================================================
 def personal_mode():
@@ -800,8 +886,7 @@ def personal_mode():
 
             ax1.set_title(f'{car_name} — 最优充电方案（22:00—{depart_time:02d}:00）')
             plt.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            add_figure_download_buttons(fig, '个人充电规划_功率与SOC变化', 'personal_power_soc')
+            show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
 
             # ── 简明建议 ─────────────────────────────────────
@@ -1081,8 +1166,7 @@ def multi_vehicle_mode():
             ax.set_title(f'各策略聚合负荷时序曲线（聚合功率上限 {P_agg_max} kW）')
             ax.legend(frameon=True, loc='upper right', fontsize=9)
             plt.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            add_figure_download_buttons(fig, '多车聚合调度_聚合负荷曲线', 'multi_agg_load')
+            show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
 
         # ── Tab2：MILP 功率热力图 ────────────────────────────────────
@@ -1094,25 +1178,20 @@ def multi_vehicle_mode():
                 p_max_all = max(v['最大功率'] for v in vehicles)
 
                 fig, ax = plt.subplots(figsize=(14, max(4, N_v * 0.5)))
-                # 使用 pcolormesh 替代 imshow：导出 SVG/PDF 时热力图单元格保持矢量形状，
-                # 插入 Word/PPT 后放大缩小也不容易模糊。
-                x_edges = np.arange(n_slots + 1)
-                y_edges = np.arange(N_v + 1)
-                mesh = ax.pcolormesh(
-                    x_edges, y_edges, P_sched_milp,
-                    cmap='YlOrRd', vmin=0, vmax=p_max_all,
-                    shading='flat', rasterized=False
-                )
-                cbar = plt.colorbar(mesh, ax=ax, label='充电功率 (kW)',
+                # 使用 pcolormesh，导出 SVG/PDF 时比 imshow 更接近矢量效果
+                x_edges = np.arange(n_slots + 1) - 0.5
+                y_edges = np.arange(N_v + 1) - 0.5
+                im = ax.pcolormesh(x_edges, y_edges, P_sched_milp, cmap='YlOrRd',
+                                    vmin=0, vmax=p_max_all, shading='flat')
+                ax.set_xlim(-0.5, n_slots - 0.5)
+                ax.set_ylim(N_v - 0.5, -0.5)
+                cbar = plt.colorbar(im, ax=ax, label='充电功率 (kW)',
                                     fraction=0.03, pad=0.02)
                 cbar.ax.tick_params(labelsize=9)
 
-                ax.set_xlim(0, n_slots)
-                ax.set_ylim(0, N_v)
-                ax.invert_yaxis()
-                ax.set_xticks(np.arange(n_slots) + 0.5)
+                ax.set_xticks(range(n_slots))
                 ax.set_xticklabels(slabels, rotation=45, fontsize=8)
-                ax.set_yticks(np.arange(N_v) + 0.5)
+                ax.set_yticks(range(N_v))
                 ax.set_yticklabels(veh_ids, fontsize=9)
                 ax.set_xlabel('时段')
                 ax.set_ylabel('车辆编号')
@@ -1122,13 +1201,11 @@ def multi_vehicle_mode():
                     for t in range(n_slots):
                         val = P_sched_milp[i][t]
                         if val > 0.3:
-                            ax.text(t + 0.5, i + 0.5, f'{val:.1f}',
-                                    ha='center', va='center',
+                            ax.text(t, i, f'{val:.1f}', ha='center', va='center',
                                     fontsize=6 if N_v > 8 else 7,
                                     color='black', fontweight='bold')
                 plt.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-                add_figure_download_buttons(fig, '多车聚合调度_MILP功率热力图', 'multi_milp_heatmap')
+                show_fig_with_downloads(fig, "ev_charging_figure")
                 plt.close()
             else:
                 st.warning("MILP 不可行，无法生成热力图。")
@@ -1174,8 +1251,7 @@ def multi_vehicle_mode():
 
             fig.suptitle('典型车辆 SOC 演化曲线', fontsize=14, fontweight='bold')
             plt.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            add_figure_download_buttons(fig, '多车聚合调度_SOC演化曲线', 'multi_soc_evolution')
+            show_fig_with_downloads(fig, "ev_charging_figure")
             plt.close()
 
         # ── Tab4：成本构成堆叠柱图 ──────────────────────────────────
@@ -1225,8 +1301,7 @@ def multi_vehicle_mode():
                 ax.legend(frameon=True)
                 ax.set_ylim(0, ax.get_ylim()[1] * 1.2)
                 plt.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-                add_figure_download_buttons(fig, '多车聚合调度_成本构成分析', 'multi_cost_breakdown')
+                show_fig_with_downloads(fig, "ev_charging_figure")
                 plt.close()
             else:
                 st.warning("没有可行策略，无法绘制成本构成图。")
@@ -1366,13 +1441,7 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    if CHINESE_FONT_NAME:
-        st.sidebar.caption(f"🖋️ 绘图中文字体：{CHINESE_FONT_NAME}")
-    else:
-        st.sidebar.warning(
-            "未检测到可用中文字体。若图中出现方框，请安装 Microsoft YaHei、SimHei 或 Noto Sans CJK 后重启应用。"
-        )
-    st.sidebar.caption("📌 插入 Word/PPT：优先下载 SVG 矢量图；PNG 仅作兼容备用。")
+    show_font_status_in_sidebar()
 
     mode = st.sidebar.radio(
         "🔀 选择模式",

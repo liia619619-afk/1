@@ -26,7 +26,14 @@ matplotlib.rcParams['font.sans-serif'] = [
     'Noto Sans CJK SC', 'Arial Unicode MS', 'DejaVu Sans'
 ]
 matplotlib.rcParams['axes.unicode_minus'] = False
-matplotlib.rcParams['figure.dpi'] = 150
+# 预览图与导出图分开控制：预览足够清楚，导出使用更高 DPI / 矢量格式
+matplotlib.rcParams['figure.dpi'] = 220
+matplotlib.rcParams['savefig.dpi'] = 600
+matplotlib.rcParams['savefig.bbox'] = 'tight'
+matplotlib.rcParams['savefig.facecolor'] = 'white'
+matplotlib.rcParams['pdf.fonttype'] = 42       # PDF 中嵌入 TrueType 字体，文字更清晰
+matplotlib.rcParams['ps.fonttype'] = 42
+matplotlib.rcParams['svg.fonttype'] = 'path'   # SVG 将文字转路径，插入 Word/PPT 后缩放不糊、不丢字体
 
 plt.rcParams.update({
     'axes.spines.top':    False,
@@ -47,6 +54,91 @@ plt.rcParams.update({
     'figure.facecolor':   'white',
     'axes.facecolor':     '#f9f9f9',
 })
+
+
+
+# =============================================================================
+# 0. 高清图像导出工具
+# =============================================================================
+# 说明：
+# - Word / PowerPoint 插入图片时，优先使用 SVG：它是矢量图，任意缩放都不会像 PNG/JPG 那样变糊。
+# - PDF 同样是矢量格式，适合论文、LaTeX、打印或后期排版。
+# - PNG 保留为 600 DPI 超高清位图，用于不支持 SVG/PDF 的场景。
+FIG_EXPORT_DPI = 600
+FIG_PREVIEW_DPI = 220
+
+
+def _fig_to_bytes(fig, fmt='svg', dpi=FIG_EXPORT_DPI):
+    """把 Matplotlib Figure 转为内存字节，供 Streamlit 下载按钮使用。"""
+    buf = io.BytesIO()
+    save_kwargs = dict(
+        format=fmt,
+        bbox_inches='tight',
+        pad_inches=0.08,
+        facecolor='white',
+        edgecolor='none',
+    )
+    if fmt.lower() in {'png', 'jpg', 'jpeg', 'tif', 'tiff'}:
+        save_kwargs['dpi'] = dpi
+    else:
+        # 矢量图本身不依赖 DPI；该参数只影响少数栅格化元素。
+        save_kwargs['dpi'] = dpi
+    fig.savefig(buf, **save_kwargs)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _show_and_download_figure(fig, basename, key_prefix, tight=True):
+    """
+    统一显示并提供高清下载：SVG/PDF 为矢量图，PNG 为 600DPI 兜底。
+
+    使用建议：
+    1. 写论文/报告/Word/PPT：优先下载 SVG 插入，放大缩小都不糊。
+    2. 排版软件或 LaTeX：优先下载 PDF。
+    3. 只接受位图的平台：下载 600DPI PNG。
+    """
+    if tight:
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+
+    # Streamlit 页面内预览；真正插入文档建议用下面的 SVG/PDF 下载文件。
+    st.pyplot(fig, clear_figure=False)
+
+    st.caption('📌 插入 Word/PPT/论文时建议优先下载 **SVG矢量图**；需要位图时再用 **600DPI PNG**。')
+    col_svg, col_pdf, col_png = st.columns(3)
+
+    with col_svg:
+        st.download_button(
+            '📥 下载SVG矢量图（推荐）',
+            data=_fig_to_bytes(fig, 'svg'),
+            file_name=f'{basename}.svg',
+            mime='image/svg+xml',
+            key=f'{key_prefix}_svg',
+            use_container_width=True,
+        )
+    with col_pdf:
+        st.download_button(
+            '📥 下载PDF矢量图',
+            data=_fig_to_bytes(fig, 'pdf'),
+            file_name=f'{basename}.pdf',
+            mime='application/pdf',
+            key=f'{key_prefix}_pdf',
+            use_container_width=True,
+        )
+    with col_png:
+        st.download_button(
+            '📥 下载600DPI PNG',
+            data=_fig_to_bytes(fig, 'png'),
+            file_name=f'{basename}.png',
+            mime='image/png',
+            key=f'{key_prefix}_png',
+            use_container_width=True,
+        )
+
+    plt.close(fig)
+
 
 try:
     import pulp
@@ -685,9 +777,11 @@ def personal_mode():
                        loc='upper left', frameon=True, fontsize=9)
 
             ax1.set_title(f'{car_name} — 最优充电方案（22:00—{depart_time:02d}:00）')
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
+            _show_and_download_figure(
+                fig,
+                basename='个人充电过程可视化',
+                key_prefix='personal_charging_process'
+            )
 
             # ── 简明建议 ─────────────────────────────────────
             st.divider()
@@ -965,9 +1059,11 @@ def multi_vehicle_mode():
             ax.set_ylabel('聚合充电功率 (kW)')
             ax.set_title(f'各策略聚合负荷时序曲线（聚合功率上限 {P_agg_max} kW）')
             ax.legend(frameon=True, loc='upper right', fontsize=9)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
+            _show_and_download_figure(
+                fig,
+                basename='多车聚合负荷曲线',
+                key_prefix='multi_load_profile'
+            )
 
         # ── Tab2：MILP 功率热力图 ────────────────────────────────────
         with tab2:
@@ -978,8 +1074,18 @@ def multi_vehicle_mode():
                 p_max_all = max(v['最大功率'] for v in vehicles)
 
                 fig, ax = plt.subplots(figsize=(14, max(4, N_v * 0.5)))
-                im = ax.imshow(P_sched_milp, cmap='YlOrRd', aspect='auto',
-                               vmin=0, vmax=p_max_all)
+                # 用 pcolormesh 代替 imshow：在 SVG/PDF 中每个色块都是矢量矩形，
+                # 插入 Word/PPT 后缩放不糊；PNG 仍按 600DPI 导出。
+                x_edges = np.arange(n_slots + 1) - 0.5
+                y_edges = np.arange(N_v + 1) - 0.5
+                im = ax.pcolormesh(
+                    x_edges, y_edges, P_sched_milp,
+                    cmap='YlOrRd', vmin=0, vmax=p_max_all,
+                    shading='flat', edgecolors='white', linewidth=0.25,
+                    rasterized=False
+                )
+                ax.set_xlim(-0.5, n_slots - 0.5)
+                ax.set_ylim(N_v - 0.5, -0.5)
                 cbar = plt.colorbar(im, ax=ax, label='充电功率 (kW)',
                                     fraction=0.03, pad=0.02)
                 cbar.ax.tick_params(labelsize=9)
@@ -999,9 +1105,11 @@ def multi_vehicle_mode():
                             ax.text(t, i, f'{val:.1f}', ha='center', va='center',
                                     fontsize=6 if N_v > 8 else 7,
                                     color='black', fontweight='bold')
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
+                _show_and_download_figure(
+                    fig,
+                    basename='MILP功率热力图',
+                    key_prefix='multi_milp_heatmap'
+                )
             else:
                 st.warning("MILP 不可行，无法生成热力图。")
 
@@ -1045,9 +1153,11 @@ def multi_vehicle_mode():
                     ax.legend(fontsize=7, loc='lower right', frameon=True)
 
             fig.suptitle('典型车辆 SOC 演化曲线', fontsize=14, fontweight='bold')
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
+            _show_and_download_figure(
+                fig,
+                basename='典型车辆SOC演化曲线',
+                key_prefix='multi_soc_evolution'
+            )
 
         # ── Tab4：成本构成堆叠柱图 ──────────────────────────────────
         with tab4:
@@ -1095,9 +1205,11 @@ def multi_vehicle_mode():
                 ax.set_title('各策略综合目标成本构成对比')
                 ax.legend(frameon=True)
                 ax.set_ylim(0, ax.get_ylim()[1] * 1.2)
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
+                _show_and_download_figure(
+                    fig,
+                    basename='各策略综合目标成本构成对比',
+                    key_prefix='multi_cost_composition'
+                )
             else:
                 st.warning("没有可行策略，无法绘制成本构成图。")
 
